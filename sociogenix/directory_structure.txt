@@ -1,0 +1,15 @@
+sociogenix/
+├── frontend/
+│   ├── frontend_src_App.js
+│   ├── frontend_src_index.js
+│   ├── frontend_package.json
+│   ├── frontend_firebase.json
+│   ├── frontend_.firebaserc
+├── functions/
+│   ├── functions_index.js
+│   ├── functions_package.json
+├── mobile/
+│   ├── mobile_lib_main.dart
+│   ├── mobile_pubspec.yaml
+├── firebase.json
+├── .firebaserc
