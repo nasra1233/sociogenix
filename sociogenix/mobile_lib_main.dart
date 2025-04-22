@@ -9,6 +9,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -52,6 +53,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Map<String, dynamic> connectedAccounts = {};
   Map<String, dynamic> campaignData = {'ad_spend': 0, 'conversions': 0, 'avg_sale': 0};
   String userRole = 'user';
+  final GoogleSignIn _googleSignIn = GoogleSignIn(scopes: ['https://www.googleapis.com/auth/youtube']);
 
   @override
   void initState() {
@@ -61,12 +63,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
       if (firebaseUser != null) {
         final doc = await FirebaseFirestore.instance.collection('users').doc(firebaseUser.uid).get();
         setState(() => userRole = doc.data()?['role'] ?? 'user');
+        fetchConnectedAccounts();
       }
     });
     loadCachedData();
     fetchAnalytics();
     fetchTrendAlerts();
-    fetchConnectedAccounts();
   }
 
   Future<void> loadCachedData() async {
@@ -103,36 +105,48 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Future<void> fetchConnectedAccounts() async {
-    final response = await http.get(Uri.parse('https://us-central1-YOUR_FIREBASE_PROJECT_ID.cloudfunctions.net/api/accounts?user_id=${user?.uid}'));
-    setState(() {
-      connectedAccounts = jsonDecode(response.body)['accounts'];
-    });
+    try {
+      final response = await http.get(Uri.parse('https://us-central1-YOUR_FIREBASE_PROJECT_ID.cloudfunctions.net/api/accounts?user_id=${user?.uid}'));
+      setState(() {
+        connectedAccounts = jsonDecode(response.body)['accounts'] ?? {};
+      });
+    } catch (e) {
+      print('Error fetching accounts: $e');
+    }
   }
 
   Future<void> connectAccount(String platform) async {
-    final credentials = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text('Connect $platform'),
-        content: TextField(
-          decoration: InputDecoration(labelText: 'Credentials (OAuth token or username:password)'),
-          onChanged: (value) => credentials = value,
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(context, credentials), child: Text('Connect')),
-        ],
-      ),
-    );
-    if (credentials != null) {
-      await http.post(
-        Uri.parse('https://us-central1-YOUR_FIREBASE_PROJECT_ID.cloudfunctions.net/api/connect'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'user_id': user?.uid, 'platform': platform, 'credentials': credentials}),
-      );
-      await fetchConnectedAccounts();
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$platform connected')));
+    try {
+      final response = await http.get(Uri.parse('https://us-central1-YOUR_FIREBASE_PROJECT_ID.cloudfunctions.net/api/oauth/$platform?user_id=${user?.uid}&redirect_uri=https://YOUR_FIREBASE_PROJECT_ID.firebaseapp.com/oauth-callback'));
+      final authUrl = jsonDecode(response.body)['authUrl'];
+      if (await canLaunch(authUrl)) {
+        await launch(authUrl);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Cannot launch $platform OAuth')));
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: ${e.toString()}')));
     }
+  }
+
+  Future<void> login() async {
+    try {
+      final googleUser = await _googleSignIn.signIn();
+      if (googleUser == null) return;
+      final googleAuth = await googleUser.authentication;
+      final credential = GoogleAuthProvider.credential(
+        accessToken: googleAuth.accessToken,
+        idToken: googleAuth.idToken,
+      );
+      await FirebaseAuth.instance.signInWithCredential(credential);
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Login failed: $e')));
+    }
+  }
+
+  Future<void> logout() async {
+    await _googleSignIn.signOut();
+    await FirebaseAuth.instance.signOut();
   }
 
   Future<void> postContent() async {
@@ -144,7 +158,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         'platforms': platforms,
         'content': content,
         'video_url': videoUrl,
-        'keywords': alerts
+        'keywords': alerts,
       }),
     );
     setState(() {
@@ -183,14 +197,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('AMA Scheduled!')));
   }
 
-  Future<void> login() async {
-    await FirebaseAuth.instance.signInWithEmailAndPassword(email: 'user@example.com', password: 'password');
-  }
-
-  Future<void> logout() async {
-    await FirebaseAuth.instance.signOut();
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -200,7 +206,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           if (user != null)
             TextButton(onPressed: logout, child: const Text('Logout', style: TextStyle(color: Colors.white)))
           else
-            TextButton(onPressed: login, child: const Text('Login', style: TextStyle(color: Colors.white)))
+            TextButton(onPressed: login, child: const Text('Sign in with Google', style: TextStyle(color: Colors.white)))
         ],
       ),
       body: SingleChildScrollView(
@@ -214,10 +220,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
               runSpacing: 8,
               children: ['instagram', 'threads', 'x.com', 'youtube', 'reddit', 'tiktok'].map((p) => ElevatedButton(
                 onPressed: connectedAccounts[p] != null ? null : () => connectAccount(p),
-                child: Text(connectedAccounts[p] != null ? '$p Connected' : 'Connect $p'),
+                child: Text(connectedAccounts[p] != null ? '${p} Connected (${connectedAccounts[p]['username']})' : 'Connect $p'),
               )).toList(),
             ),
-            Text('Connected: ${connectedAccounts.keys.map((p) => '$p: ${connectedAccounts[p]}').join(', ') ?? 'None'}'),
+            Text('Connected: ${connectedAccounts.keys.map((p) => '$p: ${connectedAccounts[p]['username'] ?? 'Connected'}').join(', ') ?? 'None'}'),
             const SizedBox(height: 16),
             const Text('Create Post', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
             TextField(
@@ -287,7 +293,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     data: analytics,
                     domainFn: (dynamic d, _) => d['timestamp'] ?? 'N/A',
                     measureFn: (dynamic d, _) => d['engagement'] ?? 0,
-                  )
+                  ),
                 ],
                 animate: true,
               ),
@@ -389,7 +395,7 @@ class _AdminScreenState extends State<AdminScreen> {
                     data: traffic,
                     domainFn: (dynamic d, _) => d['_id'],
                     measureFn: (dynamic d, _) => d['total_engagement'],
-                  )
+                  ),
                 ],
                 animate: true,
               ),
