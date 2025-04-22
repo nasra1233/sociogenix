@@ -1,4 +1,3 @@
-
 const functions = require('firebase-functions');
 const admin = require('firebase-admin');
 const axios = require('axios');
@@ -8,21 +7,190 @@ const ttsClient = new TextToSpeechClient();
 const { Storage } = require('@google-cloud/storage');
 const storage = new Storage();
 const bucket = storage.bucket('YOUR_FIREBASE_STORAGE_BUCKET');
+const { OAuth2Client } = require('google-auth-library');
+const querystring = require('querystring');
 
 admin.initializeApp();
 const db = admin.firestore();
 
-// Social media API clients (mocked for brevity)
-const REDDIT = { subreddit: () => ({ submit: async () => ({}) }) };
-const YOUTUBE = { videos: () => ({ insert: async () => ({}) }) };
-const INSTAGRAM = { video_upload: async () => ({}), photo_upload: async () => ({}), post: async () => ({}) };
-const X_API_TOKEN = 'YOUR_X_BEARER_TOKEN';
+// Social media OAuth configurations
+const oauthConfigs = {
+  instagram: {
+    authUrl: 'https://api.instagram.com/oauth/authorize',
+    tokenUrl: 'https://api.instagram.com/oauth/access_token',
+    clientId: 'YOUR_INSTAGRAM_CLIENT_ID',
+    clientSecret: 'YOUR_INSTAGRAM_CLIENT_SECRET',
+    scope: 'user_profile,user_media',
+  },
+  threads: {
+    authUrl: 'https://api.instagram.com/oauth/authorize',
+    tokenUrl: 'https://api.instagram.com/oauth/access_token',
+    clientId: 'YOUR_INSTAGRAM_CLIENT_ID',
+    clientSecret: 'YOUR_INSTAGRAM_CLIENT_SECRET',
+    scope: 'user_profile,user_media',
+  },
+  'x.com': {
+    authUrl: 'https://api.twitter.com/oauth/authorize',
+    tokenUrl: 'https://api.twitter.com/oauth/access_token',
+    clientId: 'YOUR_TWITTER_CLIENT_ID',
+    clientSecret: 'YOUR_TWITTER_CLIENT_SECRET',
+    scope: 'tweet.read tweet.write users.read',
+  },
+  youtube: {
+    authUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
+    tokenUrl: 'https://oauth2.googleapis.com/token',
+    clientId: 'YOUR_GOOGLE_CLIENT_ID',
+    clientSecret: 'YOUR_GOOGLE_CLIENT_SECRET',
+    scope: 'https://www.googleapis.com/auth/youtube',
+  },
+  reddit: {
+    authUrl: 'https://www.reddit.com/api/v1/authorize',
+    tokenUrl: 'https://www.reddit.com/api/v1/access_token',
+    clientId: 'YOUR_REDDIT_CLIENT_ID',
+    clientSecret: 'YOUR_REDDIT_CLIENT_SECRET',
+    scope: 'identity submit',
+  },
+  tiktok: {
+    authUrl: 'https://www.tiktok.com/auth/authorize',
+    tokenUrl: 'https://open-api.tiktok.com/oauth/access_token',
+    clientId: 'YOUR_TIKTOK_CLIENT_ID',
+    clientSecret: 'YOUR_TIKTOK_CLIENT_SECRET',
+    scope: 'user.info.basic,video.publish',
+  },
+};
+
+// Initialize Google OAuth2 client for YouTube
+const googleOAuth2Client = new OAuth2Client(
+  oauthConfigs.youtube.clientId,
+  oauthConfigs.youtube.clientSecret,
+  'https://us-central1-YOUR_FIREBASE_PROJECT_ID.cloudfunctions.net/api/oauth/youtube/callback'
+);
+
+// Social media API clients (real implementations)
+const INSTAGRAM_API = async (accessToken) => ({
+  post: async (content) => await axios.post('https://graph.instagram.com/v12.0/me/media', { caption: content, access_token: accessToken }),
+  video_upload: async (url, caption) => await axios.post('https://graph.instagram.com/v12.0/me/media', { video_url: url, caption, access_token: accessToken }),
+});
+const TWITTER_API = async (accessToken, accessSecret) => ({
+  post: async (content) => await axios.post('https://api.twitter.com/2/tweets', { text: content }, { headers: { Authorization: `Bearer ${accessToken}` } }),
+});
+const YOUTUBE_API = async (accessToken) => {
+  googleOAuth2Client.setCredentials({ access_token: accessToken });
+  return {
+    videos: () => ({
+      insert: async (resource) => await axios.post('https://www.googleapis.com/youtube/v3/videos', resource, { headers: { Authorization: `Bearer ${accessToken}` } }),
+    }),
+  };
+};
+const REDDIT_API = async (accessToken) => ({
+  subreddit: (name) => ({
+    submit: async ({ title, text }) => await axios.post(`https://oauth.reddit.com/r/${name}/api/submit`, { title, text, kind: 'self' }, { headers: { Authorization: `Bearer ${accessToken}` } }),
+  }),
+});
+const TIKTOK_API = async (accessToken) => ({
+  upload: async (video_url, caption) => await axios.post('https://open-api.tiktok.com/video/upload', { video_url, caption, access_token: accessToken }),
+});
 
 // Self-vulnerability scanning (mock)
 const scanVulnerabilities = () => ({ status: 'Scanned', issues: [] });
 
 // Predictive model (mock)
 const predictEngagement = (data) => data.map(() => Math.random());
+
+// OAuth initiation
+exports.oauth = functions.https.onRequest(async (req, res) => {
+  const { platform, user_id, redirect_uri } = req.query;
+  const config = oauthConfigs[platform];
+  if (!config) return res.status(400).json({ error: 'Invalid platform' });
+
+  const state = JSON.stringify({ user_id, platform, redirect_uri });
+  let authUrl;
+
+  if (platform === 'youtube') {
+    authUrl = googleOAuth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: config.scope,
+      state,
+      redirect_uri: `https://us-central1-YOUR_FIREBASE_PROJECT_ID.cloudfunctions.net/api/oauth/youtube/callback`,
+    });
+  } else if (platform === 'x.com') {
+    // Twitter uses OAuth 1.0a, handled differently
+    const response = await axios.post('https://api.twitter.com/oauth/request_token', null, {
+      headers: { Authorization: `OAuth consumer_key="${config.clientId}", consumer_secret="${config.clientSecret}"` },
+    });
+    const oauthToken = querystring.parse(response.data).oauth_token;
+    authUrl = `${config.authUrl}?oauth_token=${oauthToken}&state=${encodeURIComponent(state)}`;
+  } else {
+    authUrl = `${config.authUrl}?client_id=${config.clientId}&redirect_uri=${encodeURIComponent(redirect_uri)}&scope=${config.scope}&response_type=code&state=${encodeURIComponent(state)}`;
+  }
+
+  res.json({ authUrl });
+});
+
+// OAuth callback for all platforms
+exports.oauthCallback = functions.https.onRequest(async (req, res) => {
+  const { platform } = req.params;
+  const { code, state } = req.query;
+  const { user_id, redirect_uri } = JSON.parse(state || '{}');
+  const config = oauthConfigs[platform];
+
+  if (!config || !user_id) return res.status(400).json({ error: 'Invalid request' });
+
+  try {
+    let tokens;
+    if (platform === 'youtube') {
+      const { tokens: googleTokens } = await googleOAuth2Client.getToken({
+        code,
+        redirect_uri: `https://us-central1-YOUR_FIREBASE_PROJECT_ID.cloudfunctions.net/api/oauth/youtube/callback`,
+      });
+      tokens = { access_token: googleTokens.access_token, refresh_token: googleTokens.refresh_token };
+    } else if (platform === 'x.com') {
+      const oauthToken = req.query.oauth_token;
+      const oauthVerifier = req.query.oauth_verifier;
+      const response = await axios.post('https://api.twitter.com/oauth/access_token', querystring.stringify({ oauth_token: oauthToken, oauth_verifier: oauthVerifier }), {
+        headers: { Authorization: `OAuth consumer_key="${config.clientId}", consumer_secret="${config.clientSecret}"` },
+      });
+      const parsed = querystring.parse(response.data);
+      tokens = { access_token: parsed.oauth_token, access_secret: parsed.oauth_token_secret };
+    } else {
+      const response = await axios.post(config.tokenUrl, {
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri,
+      });
+      tokens = response.data;
+    }
+
+    // Fetch username or profile info
+    let username = 'unknown';
+    if (platform === 'instagram' || platform === 'threads') {
+      const profile = await axios.get('https://graph.instagram.com/me?fields=username&access_token=' + tokens.access_token);
+      username = profile.data.username;
+    } else if (platform === 'x.com') {
+      username = tokens.screen_name || 'twitter_user';
+    } else if (platform === 'youtube') {
+      const profile = await axios.get('https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true', { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+      username = profile.data.items[0].snippet.title;
+    } else if (platform === 'reddit') {
+      const profile = await axios.get('https://oauth.reddit.com/api/v1/me', { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+      username = profile.data.name;
+    } else if (platform === 'tiktok') {
+      const profile = await axios.get('https://open-api.tiktok.com/user/info/', { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+      username = profile.data.user.username;
+    }
+
+    await db.collection('accounts').doc(user_id).set(
+      { [platform]: { access_token: tokens.access_token, refresh_token: tokens.refresh_token, access_secret: tokens.access_secret, username } },
+      { merge: true }
+    );
+
+    res.redirect(`${redirect_uri}?status=success&platform=${platform}`);
+  } catch (error) {
+    res.redirect(`${redirect_uri}?status=error&message=${encodeURIComponent(error.message)}`);
+  }
+});
 
 // Trend scraping
 exports.scrapeTrends = functions.pubsub.schedule('every 24 hours').onRun(async () => {
@@ -32,7 +200,7 @@ exports.scrapeTrends = functions.pubsub.schedule('every 24 hours').onRun(async (
     'x.com': { metrics: ['likes', 'retweets', 'replies'], content: ['threads', 'tweets'] },
     youtube: { metrics: ['watch_time', 'ctr'], content: ['shorts', 'videos'] },
     reddit: { metrics: ['upvotes', 'comments'], content: ['posts', 'amas'] },
-    tiktok: { metrics: ['watch_time', 'completion_rate'], content: ['videos'] }
+    tiktok: { metrics: ['watch_time', 'completion_rate'], content: ['videos'] },
   };
   for (const [platform, config] of Object.entries(platforms)) {
     let data = { hashtags: [`#${platform}Trend1`, `#${platform}Trend2`, `#${platform}Trend3`], content_type: config.content[0] };
@@ -40,17 +208,10 @@ exports.scrapeTrends = functions.pubsub.schedule('every 24 hours').onRun(async (
       platform,
       trends: data.hashtags,
       content_type: data.content_type,
-      timestamp: admin.firestore.FieldValue.serverTimestamp()
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
     });
   }
   return { status: 'Trends updated' };
-});
-
-// Connect account
-exports.connect = functions.https.onRequest(async (req, res) => {
-  const { user_id, platform, credentials } = req.body;
-  await db.collection('accounts').doc(user_id).set({ [platform]: credentials }, { merge: true });
-  res.json({ status: `${platform} connected` });
 });
 
 // Get connected accounts
@@ -67,17 +228,17 @@ exports.subscribe = functions.https.onRequest(async (req, res) => {
     const customer = await stripe.customers.create({
       email: `user${user_id}@example.com`,
       payment_method,
-      invoice_settings: { default_payment_method: payment_method }
+      invoice_settings: { default_payment_method: payment_method },
     });
     const planPrices = { pro: 'price_pro_monthly', business: 'price_business_monthly', agency: 'price_agency_monthly' };
     const subscription = await stripe.subscriptions.create({
       customer: customer.id,
-      items: [{ price: planPrices[plan] }]
+      items: [{ price: planPrices[plan] }],
     });
-    await db.collection('users').doc(user_id).set({
-      subscription: plan,
-      stripe_customer_id: customer.id
-    }, { merge: true });
+    await db.collection('users').doc(user_id).set(
+      { subscription: plan, stripe_customer_id: customer.id },
+      { merge: true }
+    );
     res.json({ status: 'Subscribed', subscription_id: subscription.id });
   } catch (e) {
     res.json({ status: 'Error', error: e.message });
@@ -97,25 +258,32 @@ exports.post = functions.https.onRequest(async (req, res) => {
       continue;
     }
     try {
+      const { access_token, access_secret } = accounts[platform];
       if (platform === 'instagram') {
-        if (video_url) await INSTAGRAM.video_upload(video_url, `${content} ${keywords.join(' ')}`);
-        else await INSTAGRAM.photo_upload('placeholder.jpg', `${content} ${keywords.join(' ')}`);
+        const api = await INSTAGRAM_API(access_token);
+        if (video_url) await api.video_upload(video_url, `${content} ${keywords.join(' ')}`);
+        else await api.post(`${content} ${keywords.join(' ')}`);
       } else if (platform === 'threads') {
-        await INSTAGRAM.post(`${content} ${keywords.join(' ')}`);
+        const api = await INSTAGRAM_API(access_token);
+        await api.post(`${content} ${keywords.join(' ')}`);
       } else if (platform === 'x.com') {
-        await axios.post('https://api.twitter.com/2/tweets', { text: `${content} ${keywords.join(' ')}` }, {
-          headers: { Authorization: `Bearer ${X_API_TOKEN}` }
-        });
+        const api = await TWITTER_API(access_token, access_secret);
+        await api.post(`${content} ${keywords.join(' ')}`);
       } else if (platform === 'youtube') {
-        if (video_url) await YOUTUBE.videos().insert({
-          part: 'snippet,status',
-          resource: { snippet: { title: content.slice(0, 100), description: keywords.join(' ') }, status: { privacyStatus: 'public' } },
-          media: { body: video_url }
-        });
+        const api = await YOUTUBE_API(access_token);
+        if (video_url) {
+          await api.videos().insert({
+            part: 'snippet,status',
+            resource: { snippet: { title: content.slice(0, 100), description: keywords.join(' ') }, status: { privacyStatus: 'public' } },
+            media: { body: video_url },
+          });
+        }
       } else if (platform === 'reddit') {
-        await REDDIT.subreddit('socialmedia').submit({ title: content.slice(0, 100), text: keywords.join(' ') });
+        const api = await REDDIT_API(access_token);
+        await api.subreddit('socialmedia').submit({ title: content.slice(0, 100), text: keywords.join(' ') });
       } else if (platform === 'tiktok') {
-        await axios.post('https://api.tiktok.com/mock/upload', { video_url, caption: `${content} ${keywords.join(' ')}` });
+        const api = await TIKTOK_API(access_token);
+        await api.upload(video_url, `${content} ${keywords.join(' ')}`);
       }
       await db.collection('analytics').add({
         user_id,
@@ -128,7 +296,7 @@ exports.post = functions.https.onRequest(async (req, res) => {
         shares: 0,
         ctr: 0,
         watch_time: 0,
-        completion_rate: 0
+        completion_rate: 0,
       });
       results.push({ platform, status: 'Posted' });
     } catch (e) {
@@ -173,7 +341,7 @@ exports.tts = functions.https.onRequest(async (req, res) => {
     const [response] = await ttsClient.synthesizeSpeech({
       input: { text },
       voice: { languageCode: 'en-US', name: 'en-US-Wavenet-D' },
-      audioConfig: { audioEncoding: 'MP3' }
+      audioConfig: { audioEncoding: 'MP3' },
     });
     const file = bucket.file(`tts/${Date.now()}.mp3`);
     await file.save(response.audioContent);
@@ -196,16 +364,18 @@ exports.analytics = functions.https.onRequest(async (req, res) => {
     youtube: 'Optimize thumbnails for high CTR',
     'x.com': 'Create reply-driven threads',
     reddit: 'Post during peak subreddit hours',
-    threads: 'Use concise, trending text posts'
+    threads: 'Use concise, trending text posts',
   };
-  res.json(data.map((d, i) => ({
-    engagement: d.engagement,
-    reach: d.reach,
-    trends: d.trends,
-    prediction: predictions[i],
-    summary: `Your ${platform} posts are ${predictions[i] > 0.7 ? 'hot' : 'steady'}!`,
-    algorithm_tip: algoTips[platform] || 'Engage early for better reach'
-  })));
+  res.json(
+    data.map((d, i) => ({
+      engagement: d.engagement,
+      reach: d.reach,
+      trends: d.trends,
+      prediction: predictions[i],
+      summary: `Your ${platform} posts are ${predictions[i] > 0.7 ? 'hot' : 'steady'}!`,
+      algorithm_tip: algoTips[platform] || 'Engage early for better reach',
+    }))
+  );
 });
 
 // ROI
@@ -213,7 +383,7 @@ exports.roi = functions.https.onRequest(async (req, res) => {
   const { ad_spend, conversions, avg_sale } = req.body;
   const cost = parseFloat(ad_spend);
   const revenue = parseFloat(conversions) * parseFloat(avg_sale);
-  const roi = cost > 0 ? (revenue - cost) / cost * 100 : 0;
+  const roi = cost > 0 ? ((revenue - cost) / cost) * 100 : 0;
   res.json({ roi, recommendation: roi > 50 ? 'Boost high-engagement posts' : 'Optimize ad targeting' });
 });
 
@@ -256,7 +426,8 @@ exports.stripeWebhook = functions.https.onRequest(async (req, res) => {
 // Expose all endpoints under /api
 exports.api = functions.https.onRequest((req, res) => {
   const path = req.path.split('/')[2];
-  if (path === 'connect') return exports.connect(req, res);
+  if (path === 'oauth') return exports.oauth(req, res);
+  if (path === 'oauth' && req.path.includes('callback')) return exports.oauthCallback(req, res);
   if (path === 'accounts') return exports.accounts(req, res);
   if (path === 'subscribe') return exports.subscribe(req, res);
   if (path === 'post') return exports.post(req, res);
@@ -268,36 +439,6 @@ exports.api = functions.https.onRequest((req, res) => {
   if (path === 'trend_alerts') return exports.trendAlerts(req, res);
   if (path === 'ama_schedule') return exports.amaSchedule(req, res);
   if (path === 'scan') return exports.scan(req, res);
+  if (path === 'stripeWebhook') return exports.stripeWebhook(req, res);
   res.status(404).json({ status: 'Not found' });
 });
-
-<script type="module">
-  // Import the functions you need from the SDKs you need
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js";
-  import { getAnalytics } from "https://www.gstatic.com/firebasejs/11.6.0/firebase-analytics.js";
-  // TODO: Add SDKs for Firebase products that you want to use
-  // https://firebase.google.com/docs/web/setup#available-libraries
-
-  // Your web app's Firebase configuration
-  // For Firebase JS SDK v7.20.0 and later, measurementId is optional
-  const firebaseConfig = {
-    apiKey: "AIzaSyA4a7PeU6HqIKWv37DXfrdoLOYhvcnVmtw",
-    authDomain: "sociogenix-6f229.firebaseapp.com",
-    projectId: "sociogenix-6f229",
-    storageBucket: "sociogenix-6f229.firebasestorage.app",
-    messagingSenderId: "979776731550",
-    appId: "1:979776731550:web:d67a25614d1643a9583e8f",
-    measurementId: "G-6E00FM91V2"
-  };
-
-  // Initialize Firebase
-  const app = initializeApp(firebaseConfig);
-  const analytics = getAnalytics(app);
-</script>
-
-
-
-
-
-
-
