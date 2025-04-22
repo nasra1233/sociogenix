@@ -8,6 +8,10 @@
         "function": "api"
       },
       {
+        "source": "/oauth-callback",
+        "destination": "/index.html"
+      },
+      {
         "source": "**",
         "destination": "/index.html"
       }
